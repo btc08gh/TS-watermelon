@@ -1,5 +1,8 @@
 # wg-tool
 
+WARNING: This tool is currently under construction and has not been tested.
+It might work, it might do nothing or it could brick your router!  you have been warned.
+
 `wg-tool` is a utility for **ASUSWRT-Merlin** routers that simplifies the management of WireGuard VPN client slots (`wgc1`–`wgc5`).  
 It safely handles swapping, copying, erasing, backing up, and restoring client configurations directly from NVRAM, while always keeping timestamped backups so nothing is lost.
 
