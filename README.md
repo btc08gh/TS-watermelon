@@ -1,3 +1,5 @@
+*EXPERIMENTAL*
+
 # wg-tool
 
 WARNING: This tool was lightly tested and works well for my needs.
