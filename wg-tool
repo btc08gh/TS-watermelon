@@ -1,0 +1,411 @@
+#!/bin/sh
+# wg-tool — Swap/Copy/Zero/Backup + Make-Config for WireGuard client slots on AsusWRT-Merlin
+#
+# Usage:
+#   $(basename "$0") [-d] [-r] wgc1 wgc2             # SWAP slot 1 with slot 2
+#   $(basename "$0") [-d] [-r] -c|--copy wgc1 wgc2   # COPY slot 1 to slot 2
+#   $(basename "$0") [-d]     -z|--zero wgc1         # ZERO slot 1
+#   $(basename "$0")          -b|--backup [-m]       # BACKUP all slots, optionally write .conf too
+#   $(basename "$0")          -m|--make-config /path/to/wgc1.nvram
+#
+# Flags:
+#   -b, --backup      Backup all slots (no changes made)
+#   -c, --copy        Copy mode (default is swap)
+#   -d, --dry-run     Preview changes only; no modifications made
+#   -m, --make-config Also create .conf files (with --backup), or convert .nvram file to .conf
+#   -r, --restart     Re-enable affected clients and restart WireGuard (except for zeroed slots)
+#   -z, --zero        Zero/erase mode (one slot)
+#   -h, --help        Show help
+
+set -eu
+
+prog="$(basename "$0")"
+
+# ---------- helpers ----------
+err(){ echo "Error: $*" >&2; exit 1; }
+usage(){
+  cat >&2 <<USAGE
+
+WireGuard Configuration Management Tool for AsusWRT-Merlin
+
+COMMON OPERATIONS:
+  $prog wgc1 wgc2                    Swap configurations between slots 1 and 2
+  $prog --copy wgc1 wgc2             Copy slot 1 settings to slot 2 (overwrites slot 2)
+  $prog --zero wgc1                  Zero all settings from slot 1
+  $prog --backup                     Backup all slot configurations
+
+EXAMPLES:
+  $prog wgc2 wgc4                    Move VPN server to different slot
+  $prog --copy wgc1 wgc3 --restart   Duplicate working config and activate both
+  $prog --zero wgc5                  Remove old/unused configuration
+  $prog --backup --make-config       Save all configs with .conf files
+  $prog --dry-run wgc1 wgc2          Preview what swap would do
+
+OPTIONS:
+  -b, --backup         Backup all slots (no changes made)
+  -c, --copy           Copy mode instead of swap
+  -d, --dry-run        Preview changes only; no modifications made
+  -m, --make-config    Also create .conf files (with --backup), or convert .nvram file
+  -r, --restart        Re-enable affected clients and restart WireGuard after changes
+  -z, --zero           Zero/erase mode (one slot only)
+  -h, --help           Show this help
+
+NOTES:
+  • Only works with slots wgc1, wgc2, wgc3, wgc4, wgc5
+  • After swap/copy/clear operations, affected clients are disabled by default
+  • Use --restart to automatically re-enable and restart WireGuard
+  • All operations create automatic backups in /jffs/backups/wg_tool/
+
+USAGE
+  exit 1
+}
+
+is_slot(){ echo "$1" | grep -Eq '^wgc[1-5]$'; }
+nvget(){ nvram get "$1" 2>/dev/null; }
+nvset(){ nvram set "$1=$2"; }
+suffixes_for(){ nvram show 2>/dev/null | grep "^$1_" | cut -d= -f1 | sed "s/^$1_//" | sort -u; }
+
+# Build a .conf from LIVE NVRAM for a given slot into outdir
+make_conf_from_slot(){
+  # $1=slot $2=outdir
+  local slot="$1" outdir="$2"
+  local addr priv dns mtu ppub psk aips ep_host ep_port alive lport
+
+  addr="$(nvget ${slot}_addr)"
+  priv="$(nvget ${slot}_priv)"
+  dns="$(nvget ${slot}_dns)"
+  mtu="$(nvget ${slot}_mtu)"
+  ppub="$(nvget ${slot}_ppub)"
+  psk="$(nvget ${slot}_psk)"
+  aips="$(nvget ${slot}_aips)"
+  ep_host="$(nvget ${slot}_ep_addr)"
+  ep_port="$(nvget ${slot}_ep_port)"
+  alive="$(nvget ${slot}_alive)"
+
+  # normalize comma spacing
+  [ -n "$dns" ] && dns="$(printf "%s" "$dns" | sed 's/, */, /g')"
+  [ -n "$aips" ] && aips="$(printf "%s" "$aips" | sed 's/, */, /g')"
+
+  # ListenPort selection: explicit, live iface, or server port (template parity)
+  lport="$(nvget ${slot}_lport)"
+  [ -z "$lport" ] && lport="$(nvget ${slot}_listenport)"
+  if [ -z "$lport" ] && command -v wg >/dev/null 2>&1; then
+    lport="$(wg show "$slot" 2>/dev/null | awk '/listening port:/ {print $3; exit}')"
+  fi
+  [ -z "$lport" ] && lport="$ep_port"
+
+  {
+    echo "[Interface]"
+    [ -n "$addr" ] && echo "Address = $addr"
+    [ -n "$priv" ] && echo "PrivateKey = $priv"
+    [ -n "$lport" ] && echo "ListenPort = $lport"
+    [ -n "$dns" ] && echo "DNS = $dns"
+    # include MTU only if explicitly set in nvram
+    [ -n "$mtu" ] && echo "MTU = $mtu"
+    echo
+    echo "[Peer]"
+     [ -n "$ppub" ] && echo "PublicKey = $ppub"
+    [ -n "$aips" ] && echo "AllowedIPs = $aips"
+    [ -n "$ep_host$ep_port" ] && echo "Endpoint = ${ep_host}:${ep_port}"
+    [ -n "$alive" ] && echo "PersistentKeepalive = $alive"
+    [ -n "$psk" ] && echo "PresharedKey = $psk"
+  } > "${outdir}/${slot}.conf"
+  chmod 600 "${outdir}/${slot}.conf" || true
+}
+
+# Build a .conf from a saved .nvram file (key=value lines) next to it
+make_conf_from_nvram_file(){
+  # $1=/path/to/wgc1.nvram
+  local file="$1" dir base slot
+  [ -f "$file" ] || err "File not found: $file"
+  dir="$(dirname "$file")"
+  base="$(basename "$file" .nvram)"
+  slot="$(awk -F_ '/^wgc[1-5]_/{print $1; exit}' "$file")"
+  [ -n "$slot" ] || err "Cannot determine slot from $file (expected wgc1, wgc2, etc.)"
+
+  # helper to extract "wgc1_suffix=value" (preserve trailing =)
+  getkv(){
+    grep -E "^${slot}_$1=" "$file" | sed -e "s/^${slot}_$1=//"
+  }
+
+  addr="$(getkv addr)"
+  priv="$(getkv priv)"
+  dns="$(getkv dns)"
+  mtu="$(getkv mtu)"
+  ppub="$(getkv ppub)"
+  psk="$(getkv psk)"
+  aips="$(getkv aips)"
+  ep_host="$(getkv ep_addr)"
+  ep_port="$(getkv ep_port)"
+  alive="$(getkv alive)"
+  lport="$(getkv lport)"; [ -z "$lport" ] && lport="$(getkv listenport)"
+  [ -z "$lport" ] && lport="$ep_port"
+
+  [ -n "$dns" ] && dns="$(printf "%s" "$dns" | sed 's/, */, /g')"
+  [ -n "$aips" ] && aips="$(printf "%s" "$aips" | sed 's/, */, /g')"
+
+  {
+    echo "[Interface]"
+    [ -n "$addr" ] && echo "Address = $addr"
+    [ -n "$priv" ] && echo "PrivateKey = $priv"
+    [ -n "$lport" ] && echo "ListenPort = $lport"
+    [ -n "$dns" ] && echo "DNS = $dns"
+    [ -n "$mtu" ] && echo "MTU = $mtu"
+    echo
+    echo "[Peer]"
+    [ -n "$ppub" ] && echo "PublicKey = $ppub"
+    [ -n "$aips" ] && echo "AllowedIPs = $aips"
+    [ -n "$ep_host$ep_port" ] && echo "Endpoint = ${ep_host}:${ep_port}"
+    [ -n "$alive" ] && echo "PersistentKeepalive = $alive"
+    [ -n "$psk" ] && echo "PresharedKey = $psk"
+  } > "${dir}/${base}.conf"
+  chmod 600 "${dir}/${base}.conf" || true
+  echo "Created ${dir}/${base}.conf"
+}
+
+backup_slot(){
+  # $1=slot $2=outdir $3=makeconf(0/1)
+  local slot="$1" outdir="$2" mk="$3" file rc
+  file="${outdir}/${slot}.nvram"
+
+  # Always create/empty the file first
+  : > "$file"
+
+  # Run grep in a conditional so set -e won't abort when there are no matches
+  rc=0
+  if nvram show 2>/dev/null | grep "^${slot}_" >> "$file"; then
+    rc=0
+  else
+    # No keys for this slot; keep the file empty
+    rc=0
+  fi
+
+  chmod 600 "$file" 2>/dev/null || true
+
+  # Make a .conf only if requested
+  if [ "$mk" -eq 1 ]; then
+    # Never explode if something inside fails
+    make_conf_from_slot "$slot" "$outdir" 2>/dev/null || true
+  fi
+
+  return 0   # <- ALWAYS succeed
+}
+
+# ---------- parse flags ----------
+MODE=""         # swap|copy|zero|backup|makeconf_file
+DRY=0
+DO_RESTART=0
+MAKECONF=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -b|--backup)      MODE="backup"; shift ;;
+    -c|--copy)        MODE="copy"; shift ;;
+    -d|--dry-run)     DRY=1; shift ;;
+    -m|--make-config) MAKECONF=1; shift ;;
+    -r|--restart)     DO_RESTART=1; shift ;;
+    -z|--zero)        MODE="zero"; shift ;;
+    -h|--help)        usage ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1 (use --help for usage)" ;;
+    *) break ;;
+  esac
+done
+
+# Standalone make-config from file?
+if [ $MAKECONF -eq 1 ] && [ "${MODE:-}" = "" ] && [ $# -eq 1 ] && echo "$1" | grep -q '\.nvram$'; then
+  make_conf_from_nvram_file "$1"
+  exit 0
+fi
+
+# Default to swap if no explicit mode and not backup
+[ -z "${MODE:-}" ] && MODE="swap"
+
+# ---------- validate arguments ----------
+case "$MODE" in
+  backup)
+    [ $# -eq 0 ] || err "Backup mode takes no slot arguments (use --help for usage)"
+    ;;
+  zero)
+    [ $# -eq 1 ] || err "Zero mode requires exactly one slot (use --help for usage)"
+    SLOT_A="$1"
+    is_slot "$SLOT_A" || err "Invalid slot '$SLOT_A'. Please use wgc1, wgc2, wgc3, wgc4, or wgc5"
+    ;;
+  copy|swap)
+    [ $# -eq 2 ] || err "$MODE mode requires exactly two slots (use --help for usage)"
+    SLOT_A="$1"; SLOT_B="$2"
+    is_slot "$SLOT_A" || err "Invalid slot '$SLOT_A'. Please use wgc1, wgc2, wgc3, wgc4, or wgc5"
+    is_slot "$SLOT_B" || err "Invalid slot '$SLOT_B'. Please use wgc1, wgc2, wgc3, wgc4, or wgc5"
+    [ "$SLOT_A" != "$SLOT_B" ] || err "Cannot $MODE slot $SLOT_A with itself. Please specify two different slots"
+    ;;
+  *) err "Unknown mode: $MODE" ;;
+esac
+
+# ---------- create backup directory ----------
+TS="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="/jffs/backups/wg_tool/${TS}"
+mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"
+
+# ---------- backup-only mode ----------
+if [ "$MODE" = "backup" ] ; then
+  echo "Creating backup of all WireGuard slots..."
+  echo "Backup location: $RUN_DIR"
+  echo
+  
+  for s in wgc1 wgc2 wgc3 wgc4 wgc5; do
+    echo "• Backing up $s"
+    if ! backup_slot "$s" "$RUN_DIR" "$MAKECONF"; then
+      echo "  (warning) Backup failed for $s; continuing with others"
+    fi
+  done
+  
+  echo
+  echo "✓ Backup completed successfully"
+  echo "Files saved to: $RUN_DIR"
+  exit 0
+fi
+
+# Create backups of involved slots before making changes
+echo "Creating automatic backup..."
+backup_slot "$SLOT_A" "$RUN_DIR" "$MAKECONF"
+[ "$MODE" != "zero" ] && backup_slot "$SLOT_B" "$RUN_DIR" "$MAKECONF"
+
+# ---------- analyze what will change ----------
+case "$MODE" in
+  zero)
+    A_SETTINGS="$(suffixes_for "$SLOT_A")"
+    if [ -z "$A_SETTINGS" ]; then
+      echo "Slot $SLOT_A is already empty (no settings to zero)."
+      exit 0
+    fi
+    involved_slots="$SLOT_A"
+    ;;
+  copy)
+    A_SETTINGS="$(suffixes_for "$SLOT_A")"
+    [ -n "$A_SETTINGS" ] || err "Slot $SLOT_A has no configuration to copy"
+    involved_slots="$SLOT_A $SLOT_B"
+    ;;
+  swap)
+    A_SETTINGS="$(suffixes_for "$SLOT_A")"
+    B_SETTINGS="$(suffixes_for "$SLOT_B")"
+    UNION_SETTINGS="$(printf "%s\n%s\n" "$A_SETTINGS" "$B_SETTINGS" | sort -u)"
+    involved_slots="$SLOT_A $SLOT_B"
+    ;;
+esac
+
+# ---------- show operation summary ----------
+echo
+case "$MODE" in
+  zero)
+    echo "OPERATION: ZERO $SLOT_A"
+    echo
+    echo "⚠️  WARNING: This will permanently delete all settings for $SLOT_A"
+    echo "    Make sure you have the configuration saved elsewhere if needed."
+    echo
+    echo "What will happen:"
+    echo "• All $SLOT_A settings will be permanently removed"
+    echo "• Client $SLOT_A will be disabled"
+    echo "• Backup saved to: $RUN_DIR"
+    ;;
+  copy)
+    echo "OPERATION: COPY $SLOT_A → $SLOT_B"
+    echo
+    echo "⚠️  WARNING: This will overwrite all existing settings in $SLOT_B"
+    echo
+    echo "What will happen:"
+    echo "• All settings from $SLOT_A will be copied to $SLOT_B"
+    echo "• Any existing $SLOT_B settings will be lost"
+    echo "• Both clients will be disabled after the copy"
+    [ $DO_RESTART -eq 1 ] && echo "• Both clients will be re-enabled and WireGuard restarted"
+    echo "• Backup saved to: $RUN_DIR"
+    ;;
+  swap)
+    echo "OPERATION: SWAP $SLOT_A ↔ $SLOT_B"
+    echo
+    echo "What will happen:"
+    echo "• All settings from $SLOT_A will move to $SLOT_B"
+    echo "• All settings from $SLOT_B will move to $SLOT_A"
+    echo "• Both clients will be disabled after the swap"
+    [ $DO_RESTART -eq 1 ] && echo "• Both clients will be re-enabled and WireGuard restarted"
+    echo "• Backup saved to: $RUN_DIR"
+    ;;
+esac
+
+# Dry-run mode?
+if [ ${DRY:-0} -eq 1 ]; then
+  echo
+  echo "=== DRY RUN MODE ==="
+  echo "No changes would be made to your router configuration."
+  echo "The operation above shows what WOULD happen if you ran without --dry-run"
+  exit 0
+fi
+
+# ---------- final confirmation ----------
+echo
+printf "Continue with this operation? [y/N]: "
+read -r ans || ans=""
+case "${ans:-n}" in
+    [yY]|[yY][eE][sS]) : ;;
+    *) echo "Operation cancelled."; exit 1 ;;
+esac
+
+# ---------- apply changes ----------
+echo
+echo "Applying changes..."
+
+case "$MODE" in
+  zero)
+    echo "• Zeroing all settings from $SLOT_A..."
+    for setting in $A_SETTINGS; do 
+      nvset "${SLOT_A}_${setting}" ""
+    done
+    ;;
+  copy)
+    echo "• Copying settings from $SLOT_A to $SLOT_B..."
+    for setting in $A_SETTINGS; do
+      val="$(nvget "${SLOT_A}_${setting}")"
+      nvset "${SLOT_B}_${setting}" "$val"
+    done
+    ;;
+  swap)
+    echo "• Swapping settings between $SLOT_A and $SLOT_B..."
+    for setting in $UNION_SETTINGS; do
+      KA="${SLOT_A}_${setting}"; KB="${SLOT_B}_${setting}"
+      VA="$(nvget "$KA")"; VB="$(nvget "$KB")"
+      nvset "$KA" "$VB"
+      nvset "$KB" "$VA"
+    done
+    ;;
+esac
+
+# Force involved clients OFF
+echo "• Disabling affected clients..."
+for slot in $involved_slots; do
+  nvset "${slot}_enable" "0"
+done
+
+echo "• Saving changes to router..."
+nvram commit
+
+# Optional restart + re-enable (not for zero)
+if [ ${DO_RESTART:-0} -eq 1 ] && [ "$MODE" != "zero" ]; then
+  echo "• Re-enabling clients and restarting WireGuard..."
+  for slot in $involved_slots; do 
+    nvset "${slot}_enable" "1"
+  done
+  nvram commit
+  if command -v service >/dev/null 2>&1; then 
+    service restart_wireguard 2>/dev/null || true
+  fi
+  echo
+  echo "✓ Operation completed successfully"
+  echo "  Re-enabled and restarted: $involved_slots"
+else
+  echo
+  echo "✓ Operation completed successfully"
+  echo "  Affected clients are disabled (as requested)"
+  echo "  Use the GUI or run again with --restart to enable and restart WireGuard"
+fi
+
+echo
+echo "Backup location: $RUN_DIR"
